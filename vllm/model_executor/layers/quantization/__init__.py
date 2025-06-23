@@ -32,6 +32,7 @@ QuantizationMethods = Literal[
     "neuron_quant",
     "ipex",
     "quark",
+    "quartet",
     "moe_wna16",
     "torchao",
     "auto-round",
@@ -110,6 +111,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .neuron_quant import NeuronQuantConfig
     from .ptpc_fp8 import PTPCFp8Config
     from .qqq import QQQConfig
+    from .quartet import QuartetConfig
     from .torchao import TorchAOConfig
     from .tpu_int8 import Int8TpuConfig
 
@@ -139,6 +141,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "neuron_quant": NeuronQuantConfig,
         "ipex": IPEXConfig,
         "quark": QuarkConfig,
+        "quartet": QuartetConfig,
         "moe_wna16": MoeWNA16Config,
         "torchao": TorchAOConfig,
         "auto-round": AutoRoundConfig,
