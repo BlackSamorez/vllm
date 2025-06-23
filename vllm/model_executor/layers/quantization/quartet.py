@@ -75,6 +75,25 @@ class QuartetConfig(QuantizationConfig):
         return None
 
 
+@torch.library.custom_op("quartet::quantized_forward", mutates_args=())
+def quantized_forward(x: torch.Tensor, weight_q: torch.Tensor, weight_scales: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor) -> torch.Tensor:
+    x_flat = x.contiguous().flatten(end_dim=-2)
+    x_flat_q, x_flat_scales, _ = fusedQuantize(x_flat, forward_hadamard_matrix)
+
+    y = matmul_mxf4_bf16_tn(x_flat_q, weight_q, to_blocked(x_flat_scales), to_blocked(weight_scales), 1.)
+    
+    y = y.unflatten(dim=0, sizes=x.shape[:-1])
+    if bias is not None:
+        y += bias
+    
+    return y
+
+
+@quantized_forward.register_fake
+def _(x, weight_q, weight_scales, bias, forward_hadamard_matrix):
+    return x.new_empty(*x.shape[:-1], weight_q.shape[0])
+
+
 class QuartetLinearMethod(LinearMethodBase):
     """Linear method for Quartet.
 
@@ -104,10 +123,6 @@ class QuartetLinearMethod(LinearMethodBase):
         assert self.quant_config.forward_dtype == "mxfp4", "Only mxfp4 is supported for now"
         weight_q = Parameter(
             torch.empty(
-                # There could actually be two pack factors, one along input and
-                # one along output, but we don't currently support
-                # out_group_size, and only the one along output needs to be
-                # marked with "packed_dim" in order for QKVLinear to work.
                 sum(output_partition_sizes),
                 input_size_per_partition // 2,
                 dtype=torch.uint8,
@@ -126,16 +141,16 @@ class QuartetLinearMethod(LinearMethodBase):
 
         assert self.quant_config.exponent_dtype == "e8m0", "Only e8m0 is supported for now"
         assert self.quant_config.group_size == 32, "Only group size of 32 is supported for now"
-        shared_exponents = Parameter(
+        scales = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
                 input_size_per_partition // self.quant_config.group_size,
-                dtype=torch.float8_e8m0fnu,
+                dtype=torch.uint8,
             ),
             requires_grad=False,
         )
         set_weight_attrs(
-            shared_exponents,
+            scales,
             {
                 "input_dim": 1,
                 "output_dim": 0,
@@ -149,24 +164,19 @@ class QuartetLinearMethod(LinearMethodBase):
             torch.empty(self.quant_config.group_size, self.quant_config.group_size, dtype=params_dtype),
             requires_grad=False,
         )
+        backward_hadamard_matrix = Parameter(
+            torch.empty(self.quant_config.group_size, self.quant_config.group_size, dtype=params_dtype),
+            requires_grad=False,
+        )
 
         layer.register_parameter("weight_q", weight_q)
         set_weight_attrs(weight_q, extra_weight_attrs)
-        layer.register_parameter("shared_exponents", shared_exponents)
-        set_weight_attrs(shared_exponents, extra_weight_attrs)
+        layer.register_parameter("scales", scales)
+        set_weight_attrs(scales, extra_weight_attrs)
         layer.register_parameter("forward_hadamard_matrix", forward_hadamard_matrix)
         set_weight_attrs(forward_hadamard_matrix, extra_weight_attrs)
-        
-        
-    def forward_quantize(
-        self,
-        x: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        match (self.quant_config.exponent_dtype, self.quant_config.group_size):
-            case ("e8m0", 32):
-                return fusedQuantize(x, self.forward_hadamard_matrix)
-            case _:
-                raise ValueError(f"Unsupported forward dtype: {self.quant_config.exponent_dtype} and group size: {self.quant_config.group_size}")
+        layer.register_parameter("backward_hadamard_matrix", backward_hadamard_matrix)
+        set_weight_attrs(backward_hadamard_matrix, extra_weight_attrs)
 
 
     def apply(
@@ -175,17 +185,4 @@ class QuartetLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        weight_q = layer.weight_q
-        weight_shared_exponents = layer.shared_exponents
-
-        # Quartet forward quantization
-        x_flat = x.contiguous().flatten(end_dim=-2)
-        x_flat_q, x_flat_shared_exponents, _ = self.forward_quantize(x_flat)
-
-        y = matmul_mxf4_bf16_tn(x_flat_q, weight_q, to_blocked(x_flat_shared_exponents), to_blocked(weight_shared_exponents), 1.)
-        
-        y = y.unflatten(dim=0, sizes=x.shape[:-1])
-        if bias is not None:
-            y += bias
-        
-        return y
+        return quantized_forward(x, layer.weight_q, layer.scales, bias, layer.forward_hadamard_matrix)
