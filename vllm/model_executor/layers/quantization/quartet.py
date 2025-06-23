@@ -29,17 +29,20 @@ class QuartetConfig(QuantizationConfig):
         self,
         group_size: int = 32,
         do_hadamard: bool = True,
-        exponent_type: str = "e8m0",
+        forward_dtype: str = "mxfp4",
+        exponent_dtype: str = "e8m0",
     ) -> None:
         super().__init__()
         self.group_size = group_size
         self.do_hadamard = do_hadamard
-        self.exponent_type = exponent_type
+        self.forward_dtype = forward_dtype
+        self.exponent_dtype = exponent_dtype
 
     def __repr__(self) -> str:
         return (f"QuartetConfig(group_size={self.group_size}, "
                 f"do_hadamard={self.do_hadamard}, "
-                f"exponent_type={self.exponent_type})")
+                f"forward_dtype={self.forward_dtype}, "
+                f"exponent_dtype={self.exponent_dtype})")
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -61,8 +64,9 @@ class QuartetConfig(QuantizationConfig):
     def from_config(cls, config: dict[str, Any]) -> "QuartetConfig":
         group_size = cls.get_from_keys(config, ["group_size"])
         do_hadamard = cls.get_from_keys(config, ["do_hadamard"])
-        exponent_type = cls.get_from_keys(config, ["exponent_type"])
-        return cls(group_size, do_hadamard, exponent_type)
+        forward_dtype = cls.get_from_keys(config, ["forward_dtype"])
+        exponent_dtype = cls.get_from_keys(config, ["exponent_dtype"])
+        return cls(group_size, do_hadamard, forward_dtype, exponent_dtype)
 
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> Optional["QuartetLinearMethod"]:
@@ -97,6 +101,7 @@ class QuartetLinearMethod(LinearMethodBase):
                 "weight shape. This can be caused by too large "
                 "tensor parallel size. Or other skill issues.")
 
+        assert self.quant_config.forward_dtype == "mxfp4", "Only mxfp4 is supported for now"
         weight_q = Parameter(
             torch.empty(
                 # There could actually be two pack factors, one along input and
@@ -119,7 +124,7 @@ class QuartetLinearMethod(LinearMethodBase):
             },
         )
 
-        assert self.quant_config.exponent_type == "e8m0", "Only e8m0 is supported for now"
+        assert self.quant_config.exponent_dtype == "e8m0", "Only e8m0 is supported for now"
         assert self.quant_config.group_size == 32, "Only group size of 32 is supported for now"
         shared_exponents = Parameter(
             torch.empty(
@@ -157,11 +162,11 @@ class QuartetLinearMethod(LinearMethodBase):
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        match (self.quant_config.exponent_type, self.quant_config.group_size):
+        match (self.quant_config.exponent_dtype, self.quant_config.group_size):
             case ("e8m0", 32):
                 return fusedQuantize(x, self.forward_hadamard_matrix)
             case _:
-                raise ValueError(f"Unsupported forward dtype: {self.quant_config.exponent_type} and group size: {self.quant_config.group_size}")
+                raise ValueError(f"Unsupported forward dtype: {self.quant_config.exponent_dtype} and group size: {self.quant_config.group_size}")
 
 
     def apply(
