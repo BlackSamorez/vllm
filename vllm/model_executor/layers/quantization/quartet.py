@@ -75,23 +75,45 @@ class QuartetConfig(QuantizationConfig):
         return None
 
 
-@torch.library.custom_op("quartet::quantized_forward", mutates_args=())
-def quantized_forward(x: torch.Tensor, weight_q: torch.Tensor, weight_scales: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor) -> torch.Tensor:
-    x_flat = x.contiguous().flatten(end_dim=-2)
-    x_flat_q, x_flat_scales, _ = fusedQuantize(x_flat, forward_hadamard_matrix)
+@torch.library.custom_op("quartet::fused_quantize_op", mutates_args=())
+def fused_quantize_op(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if x_flat.shape[-1] % 32 != 0:
+        raise ValueError(f"x_flat.shape[-1] % 32 != 0: {x_flat.shape}")
+    return fusedQuantize(x_flat, hadamard_matrix)
 
-    y = matmul_mxf4_bf16_tn(x_flat_q, weight_q, to_blocked(x_flat_scales), to_blocked(weight_scales), 1.)
+
+@fused_quantize_op.register_fake
+def _(x_flat, hadamard_matrix):
+    return (
+        x_flat.new_empty(x_flat.shape[0], x_flat.shape[1] // 2, dtype=torch.uint8),
+        x_flat.new_empty(x_flat.shape[0], x_flat.shape[1] // 32, dtype=torch.uint8),
+        x_flat.new_empty(x_flat.shape[0], x_flat.shape[1] // 8, dtype=torch.uint8),
+    )
+
+
+@torch.library.custom_op("quartet::matmul_mxf4_bf16_tn", mutates_args=())
+def matmul_mxf4_bf16_tn_op(x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor, ws: torch.Tensor, alpha: float) -> torch.Tensor:
+    if x.shape[-1] % 32 != 0:
+        raise ValueError(f"x.shape[-1] % 32 != 0: {x.shape}")
+    return matmul_mxf4_bf16_tn(x, w, xs, ws, alpha)
+
+
+@matmul_mxf4_bf16_tn_op.register_fake
+def _(x, w, xs, ws, alpha):
+    return x.new_empty(*x.shape[:-1], w.shape[0], dtype=torch.bfloat16)
+
+
+def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor) -> torch.Tensor:
+    x_flat = x.contiguous().flatten(end_dim=-2)
+    x_flat_q, x_flat_scales, _ = fused_quantize_op(x_flat, forward_hadamard_matrix)
+
+    y = matmul_mxf4_bf16_tn_op(x_flat_q, qweight, to_blocked(x_flat_scales), to_blocked(weight_scales), 1. / 9.)
     
-    y = y.unflatten(dim=0, sizes=x.shape[:-1])
+    y = y.view(*x.shape[:-1], y.shape[-1])
     if bias is not None:
         y += bias
     
     return y
-
-
-@quantized_forward.register_fake
-def _(x, weight_q, weight_scales, bias, forward_hadamard_matrix):
-    return x.new_empty(*x.shape[:-1], weight_q.shape[0])
 
 
 class QuartetLinearMethod(LinearMethodBase):
@@ -121,7 +143,7 @@ class QuartetLinearMethod(LinearMethodBase):
                 "tensor parallel size. Or other skill issues.")
 
         assert self.quant_config.forward_dtype == "mxfp4", "Only mxfp4 is supported for now"
-        weight_q = Parameter(
+        qweight = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
                 input_size_per_partition // 2,
@@ -130,7 +152,7 @@ class QuartetLinearMethod(LinearMethodBase):
             requires_grad=False,
         )
         set_weight_attrs(
-            weight_q,
+            qweight,
             {
                 "input_dim": 1,
                 "output_dim": 0,
@@ -164,13 +186,15 @@ class QuartetLinearMethod(LinearMethodBase):
             torch.empty(self.quant_config.group_size, self.quant_config.group_size, dtype=params_dtype),
             requires_grad=False,
         )
+        set_weight_attrs(forward_hadamard_matrix, {"ignore_warning": True})
         backward_hadamard_matrix = Parameter(
             torch.empty(self.quant_config.group_size, self.quant_config.group_size, dtype=params_dtype),
             requires_grad=False,
         )
+        set_weight_attrs(backward_hadamard_matrix, {"ignore_warning": True})
 
-        layer.register_parameter("weight_q", weight_q)
-        set_weight_attrs(weight_q, extra_weight_attrs)
+        layer.register_parameter("qweight", qweight)
+        set_weight_attrs(qweight, extra_weight_attrs)
         layer.register_parameter("scales", scales)
         set_weight_attrs(scales, extra_weight_attrs)
         layer.register_parameter("forward_hadamard_matrix", forward_hadamard_matrix)
@@ -185,4 +209,4 @@ class QuartetLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return quantized_forward(x, layer.weight_q, layer.scales, bias, layer.forward_hadamard_matrix)
+        return quantized_forward(x, layer.qweight, layer.scales, bias, layer.forward_hadamard_matrix)
