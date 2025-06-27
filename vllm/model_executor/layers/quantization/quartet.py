@@ -29,17 +29,17 @@ class QuartetConfig(QuantizationConfig):
         self,
         hadamard_group_size: int = 32,
         forward_dtype: str = "mxfp4",
-        forward_quest: bool = False,
+        forward_method: str = "abs_max",
     ) -> None:
         super().__init__()
         self.hadamard_group_size = hadamard_group_size
         self.forward_dtype = forward_dtype
-        self.forward_quest = forward_quest
+        self.forward_method = forward_method
 
     def __repr__(self) -> str:
         return (f"QuartetConfig(hadamard_group_size={self.hadamard_group_size}, "
                 f"forward_dtype={self.forward_dtype}, "
-                f"forward_quest={self.forward_quest})")
+                f"forward_method={self.forward_method})")
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -61,8 +61,8 @@ class QuartetConfig(QuantizationConfig):
     def from_config(cls, config: dict[str, Any]) -> "QuartetConfig":
         hadamard_group_size = cls.get_from_keys(config, ["hadamard_group_size"])
         forward_dtype = cls.get_from_keys(config, ["forward_dtype"])
-        forward_quest = cls.get_from_keys(config, ["forward_quest"])
-        return cls(hadamard_group_size, forward_dtype, forward_quest)
+        forward_method = cls.get_from_keys(config, ["forward_method"])
+        return cls(hadamard_group_size, forward_dtype, forward_method)
 
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> Optional["QuartetLinearMethod"]:
@@ -72,13 +72,13 @@ class QuartetConfig(QuantizationConfig):
 
 
 @torch.library.custom_op("quartet::fused_quantize_op", mutates_args=())
-def fused_quantize_mx_op(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor, quest: bool) -> tuple[torch.Tensor, torch.Tensor]:
+def fused_quantize_mx_op(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor, forward_method: str) -> tuple[torch.Tensor, torch.Tensor]:
     if x_flat.shape[-1] % 32 != 0:
         raise ValueError(f"x_flat.shape[-1] % 32 != 0: {x_flat.shape}")
-    return fusedQuantizeMx(x_flat, hadamard_matrix)
+    return fusedQuantizeMx(x_flat, hadamard_matrix, method=forward_method)
 
 @fused_quantize_mx_op.register_fake
-def _(x_flat, hadamard_matrix, quest):
+def _(x_flat, hadamard_matrix, forward_method):
     return (
         torch.empty(x_flat.shape[0], x_flat.shape[1] // 2, dtype=torch.uint8, device=x_flat.device),
         torch.empty(x_flat.shape[0], x_flat.shape[1] // 32, dtype=torch.uint8, device=x_flat.device),
@@ -97,9 +97,9 @@ def _(x, w, xs, ws, alpha):
     return torch.empty(*x.shape[:-1], w.shape[0], dtype=torch.bfloat16, device=x.device)
 
 
-def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor, quest: bool) -> torch.Tensor:
+def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor, forward_method: str) -> torch.Tensor:
     x_flat = x.contiguous().flatten(end_dim=-2)
-    x_flat_q, x_flat_scales = fused_quantize_mx_op(x_flat, forward_hadamard_matrix, quest)
+    x_flat_q, x_flat_scales = fused_quantize_mx_op(x_flat, forward_hadamard_matrix, forward_method)
 
     y = matmul_mxf4_bf16_tn_op(x_flat_q, qweight, to_blocked(x_flat_scales), to_blocked(weight_scales), 1. / 9.)
     
@@ -201,4 +201,4 @@ class QuartetLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return quantized_forward(x, layer.qweight, layer.scales, bias, layer.forward_hadamard_matrix, self.quant_config.forward_quest)
+        return quantized_forward(x, layer.qweight, layer.scales, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method)
