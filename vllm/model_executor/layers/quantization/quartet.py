@@ -73,8 +73,6 @@ class QuartetConfig(QuantizationConfig):
 
 @torch.library.custom_op("quartet::fused_quantize_op", mutates_args=())
 def fused_quantize_mx_op(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor, forward_method: str) -> tuple[torch.Tensor, torch.Tensor]:
-    if x_flat.shape[-1] % 32 != 0:
-        raise ValueError(f"x_flat.shape[-1] % 32 != 0: {x_flat.shape}")
     return fusedQuantizeMx(x_flat, hadamard_matrix, method=forward_method)
 
 @fused_quantize_mx_op.register_fake
@@ -87,8 +85,6 @@ def _(x_flat, hadamard_matrix, forward_method):
 
 @torch.library.custom_op("quartet::matmul_mxf4_bf16_tn", mutates_args=())
 def matmul_mxf4_bf16_tn_op(x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor, ws: torch.Tensor, alpha: float) -> torch.Tensor:
-    if x.shape[-1] % 32 != 0:
-        raise ValueError(f"x.shape[-1] % 32 != 0: {x.shape}")
     return matmul_mxf4_bf16_tn(x, w, xs.view(torch.float8_e8m0fnu), ws.view(torch.float8_e8m0fnu), alpha)
 
 
