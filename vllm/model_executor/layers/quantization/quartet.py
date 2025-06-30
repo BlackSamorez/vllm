@@ -20,6 +20,8 @@ from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
+from vllm.utils import direct_register_custom_op
 
 
 class QuartetConfig(QuantizationConfig):
@@ -69,41 +71,6 @@ class QuartetConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return QuartetLinearMethod(self)
         return None
-
-
-@torch.library.custom_op("quartet::fused_quantize_op", mutates_args=())
-def fused_quantize_mx_op(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor, forward_method: str) -> tuple[torch.Tensor, torch.Tensor]:
-    return fusedQuantizeMx(x_flat, hadamard_matrix, method=forward_method)
-
-@fused_quantize_mx_op.register_fake
-def _(x_flat, hadamard_matrix, forward_method):
-    return (
-        torch.empty(x_flat.shape[0], x_flat.shape[1] // 2, dtype=torch.uint8, device=x_flat.device),
-        torch.empty(x_flat.shape[0], x_flat.shape[1] // 32, dtype=torch.uint8, device=x_flat.device),
-    )
-
-
-@torch.library.custom_op("quartet::matmul_mxf4_bf16_tn", mutates_args=())
-def matmul_mxf4_bf16_tn_op(x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor, ws: torch.Tensor, alpha: float) -> torch.Tensor:
-    return matmul_mxf4_bf16_tn(x, w, xs.view(torch.float8_e8m0fnu), ws.view(torch.float8_e8m0fnu), alpha)
-
-
-@matmul_mxf4_bf16_tn_op.register_fake
-def _(x, w, xs, ws, alpha):
-    return torch.empty(*x.shape[:-1], w.shape[0], dtype=torch.bfloat16, device=x.device)
-
-
-def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor, forward_method: str) -> torch.Tensor:
-    x_flat = x.contiguous().flatten(end_dim=-2)
-    x_flat_q, x_flat_scales = fused_quantize_mx_op(x_flat, forward_hadamard_matrix, forward_method)
-
-    y = matmul_mxf4_bf16_tn_op(x_flat_q, qweight, to_blocked(x_flat_scales), to_blocked(weight_scales), 1. / 9.)
-    
-    y = y.view(*x.shape[:-1], y.shape[-1])
-    if bias is not None:
-        y += bias
-    
-    return y
 
 
 class QuartetLinearMethod(LinearMethodBase):
@@ -198,3 +165,61 @@ class QuartetLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return quantized_forward(x, layer.qweight, layer.scales, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method)
+
+
+def fused_quantize_mx(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor, forward_method: str) -> tuple[torch.Tensor, torch.Tensor]:
+    return fusedQuantizeMx(x_flat, hadamard_matrix, method=forward_method)
+
+
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def fused_quantize_mx_fake(x_flat, hadamard_matrix, forward_method):
+    rows, cols = x_flat.size(0), x_flat.size(1)//32
+    padded_rows = ((rows + 128 - 1) // 128) * 128
+    padded_cols = ((cols + 4 - 1) // 4) * 4
+    
+    xh_e2m1 = torch.empty(x_flat.size(0), x_flat.size(1) // 2, dtype=torch.uint8, device=x_flat.device)
+    xh_e8m0 = torch.empty(padded_rows, padded_cols, dtype=torch.float8_e8m0fnu, device=x_flat.device)
+
+    return xh_e2m1, xh_e8m0
+    
+
+direct_register_custom_op(
+    op_name="fused_quantize_mx",
+    op_func=fused_quantize_mx,
+    mutates_args=[],
+    fake_impl=fused_quantize_mx_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+
+def matmul_mxf4_bf16(x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor, ws: torch.Tensor, alpha: float) -> torch.Tensor:
+    return matmul_mxf4_bf16_tn(x, w, xs.view(torch.float8_e8m0fnu), ws.view(torch.float8_e8m0fnu), alpha)
+
+
+def matmul_mxf4_bf16_fake(x, w, xs, ws, alpha):
+    return torch.empty(*x.shape[:-1], w.shape[0], dtype=torch.bfloat16, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="matmul_mxf4_bf16",
+    op_func=matmul_mxf4_bf16,
+    mutates_args=[],
+    fake_impl=matmul_mxf4_bf16_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+
+def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor, forward_method: str) -> torch.Tensor:
+    x_flat = x.contiguous().flatten(end_dim=-2)
+    x_flat_q, x_flat_scales = torch.ops.vllm.fused_quantize_mx(x_flat, forward_hadamard_matrix, forward_method)
+
+    y = torch.ops.vllm.matmul_mxf4_bf16(x_flat_q, qweight, to_blocked(x_flat_scales), to_blocked(weight_scales), 1. / 9.)
+    
+    y = y.view(*x.shape[:-1], y.shape[-1])
+    if bias is not None:
+        y += bias
+    
+    return y
