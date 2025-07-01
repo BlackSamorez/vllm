@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# Supports Quartet compression, see https://arxiv.org/abs/2505.14669
+# Supports FP-Quant compression, see https://arxiv.org/abs/2505.14669
 
 import math
 from typing import Any, Optional
@@ -12,7 +12,6 @@ from torch.nn.parameter import Parameter
 
 from qutlass import matmul_mxf4_bf16_tn, fusedQuantizeMx
 from qutlass.utils import to_blocked
-import quartet
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
@@ -24,8 +23,8 @@ from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
 
 
-class QuartetConfig(QuantizationConfig):
-    """Config class for Quartet."""
+class FPQuantConfig(QuantizationConfig):
+    """Config class for FPQuant."""
 
     def __init__(
         self,
@@ -39,13 +38,13 @@ class QuartetConfig(QuantizationConfig):
         self.forward_method = forward_method
 
     def __repr__(self) -> str:
-        return (f"QuartetConfig(hadamard_group_size={self.hadamard_group_size}, "
+        return (f"FPQuantConfig(hadamard_group_size={self.hadamard_group_size}, "
                 f"forward_dtype={self.forward_dtype}, "
                 f"forward_method={self.forward_method})")
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
-        return "quartet"
+        return "fp_quant"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
@@ -60,27 +59,27 @@ class QuartetConfig(QuantizationConfig):
         return []  # no extra configs.
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "QuartetConfig":
+    def from_config(cls, config: dict[str, Any]) -> "FPQuantConfig":
         hadamard_group_size = cls.get_from_keys(config, ["hadamard_group_size"])
         forward_dtype = cls.get_from_keys(config, ["forward_dtype"])
         forward_method = cls.get_from_keys(config, ["forward_method"])
         return cls(hadamard_group_size, forward_dtype, forward_method)
 
     def get_quant_method(self, layer: torch.nn.Module,
-                         prefix: str) -> Optional["QuartetLinearMethod"]:
+                         prefix: str) -> Optional["FPQuantLinearMethod"]:
         if isinstance(layer, LinearBase):
-            return QuartetLinearMethod(self)
+            return FPQuantLinearMethod(self)
         return None
 
 
-class QuartetLinearMethod(LinearMethodBase):
-    """Linear method for Quartet.
+class FPQuantLinearMethod(LinearMethodBase):
+    """Linear method for FPQuant.
 
     Args:
-        quant_config: The Quartet quantization config.
+        quant_config: The FPQuant quantization config.
     """
 
-    def __init__(self, quant_config: QuartetConfig):
+    def __init__(self, quant_config: FPQuantConfig):
         self.quant_config = quant_config
 
     def create_weights(self, layer: torch.nn.Module,
@@ -92,7 +91,7 @@ class QuartetLinearMethod(LinearMethodBase):
         del input_size  # Unused.
 
         if params_dtype != torch.bfloat16:
-            raise ValueError("Only bfloat16 is currently supported by Quartet")
+            raise ValueError("Only bfloat16 is currently supported by FPQuant")
         if input_size_per_partition % self.quant_config.hadamard_group_size != 0:
             raise ValueError(
                 "The input size is not aligned with the quantized "
