@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from qutlass import matmul_mxf4_bf16_tn, fusedQuantizeMx
+from qutlass import matmul_mxf4_bf16_tn, matmul_ada_mxf4_bf16_tn, fusedQuantizeMx
 from qutlass.utils import to_blocked
 
 from vllm import _custom_ops as ops
@@ -195,7 +195,7 @@ direct_register_custom_op(
 
 
 def matmul_mxf4_bf16(x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor, ws: torch.Tensor, alpha: float) -> torch.Tensor:
-    return matmul_mxf4_bf16_tn(x, w, xs.view(torch.float8_e8m0fnu), ws.view(torch.float8_e8m0fnu), alpha)
+    return matmul_mxf4_bf16_tn(x, w, to_blocked(xs).view(torch.float8_e8m0fnu), to_blocked(ws).view(torch.float8_e8m0fnu), alpha)
 
 
 def matmul_mxf4_bf16_fake(x, w, xs, ws, alpha):
@@ -211,11 +211,31 @@ direct_register_custom_op(
 )
 
 
+def matmul_ada_mxf4_bf16(x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor, ws: torch.Tensor, alpha: float) -> torch.Tensor:
+    return matmul_ada_mxf4_bf16_tn(x, w, xs.view(torch.float8_e8m0fnu), ws.view(torch.float8_e8m0fnu), alpha)
+
+
+def matmul_ada_mxf4_bf16_fake(x, w, xs, ws, alpha):
+    return torch.empty(*x.shape[:-1], w.shape[0], dtype=torch.bfloat16, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="matmul_ada_mxf4_bf16",
+    op_func=matmul_ada_mxf4_bf16,
+    mutates_args=[],
+    fake_impl=matmul_ada_mxf4_bf16_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+
 def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor, forward_method: str) -> torch.Tensor:
     x_flat = x.contiguous().flatten(end_dim=-2)
     x_flat_q, x_flat_scales = torch.ops.vllm.fused_quantize_mx(x_flat, forward_hadamard_matrix, forward_method)
 
-    y = torch.ops.vllm.matmul_mxf4_bf16(x_flat_q, qweight, to_blocked(x_flat_scales), to_blocked(weight_scales), 1. / 9.)
+    if x_flat.shape[-1] <= 64:
+        y = torch.ops.vllm.matmul_ada_mxf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, 1. / 9.)
+    else:
+        y = torch.ops.vllm.matmul_mxf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, 1. / 9.)
     
     y = y.view(*x.shape[:-1], y.shape[-1])
     if bias is not None:
