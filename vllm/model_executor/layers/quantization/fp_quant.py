@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from qutlass import matmul_mxf4_bf16_tn, matmul_ada_mxf4_bf16_tn, fusedQuantizeMx
+from qutlass import matmul_mxf4_bf16_tn, matmul_ada_mxf4_bf16_tn, fusedQuantizeMx, matmul_nvf4_bf16_tn, fusedQuantizeNv
 from qutlass.utils import to_blocked
 
 from vllm import _custom_ops as ops
@@ -117,11 +117,18 @@ class FPQuantLinearMethod(LinearMethodBase):
             },
         )
 
-        assert self.quant_config.hadamard_group_size == 32, "Only hadamard_group_size of 32 is supported for now"
+        if self.quant_config.forward_dtype == "mxfp4":
+            group_size = 32
+        elif self.quant_config.forward_dtype == "nvfp4":
+            group_size = 16
+        else:
+            raise ValueError(f"Unsupported forward_dtype: {self.quant_config.forward_dtype}")
+        
+        assert self.quant_config.hadamard_group_size == group_size, "Only hadamard_group_size of 32 is supported for now"
         scales = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
-                input_size_per_partition // 32,
+                input_size_per_partition // group_size,
                 dtype=torch.uint8,
             ),
             requires_grad=False,
@@ -136,6 +143,16 @@ class FPQuantLinearMethod(LinearMethodBase):
             },
         )
 
+        weight_global_scale = Parameter(
+            torch.empty(1, dtype=params_dtype),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight_global_scale, {"ignore_warning": True})
+        act_global_scale = Parameter(
+            torch.empty(1, dtype=params_dtype),
+            requires_grad=False,
+        )
+        set_weight_attrs(act_global_scale, {"ignore_warning": True})
         forward_hadamard_matrix = Parameter(
             torch.empty(self.quant_config.hadamard_group_size, self.quant_config.hadamard_group_size, dtype=params_dtype),
             requires_grad=False,
@@ -163,7 +180,7 @@ class FPQuantLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return quantized_forward(x, layer.qweight, layer.scales, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method)
+        return quantized_forward(x, layer.qweight, layer.scales, layer.weight_global_scale, layer.act_global_scale, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method)
 
 
 def fused_quantize_mx(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor, forward_method: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -194,7 +211,7 @@ direct_register_custom_op(
 )
 
 
-def matmul_mxf4_bf16(x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor, ws: torch.Tensor, alpha: float) -> torch.Tensor:
+def matmul_mxf4_bf16(x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor, ws: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     return matmul_mxf4_bf16_tn(x, w, to_blocked(xs).view(torch.float8_e8m0fnu), to_blocked(ws).view(torch.float8_e8m0fnu), alpha)
 
 
@@ -211,7 +228,7 @@ direct_register_custom_op(
 )
 
 
-def matmul_ada_mxf4_bf16(x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor, ws: torch.Tensor, alpha: float) -> torch.Tensor:
+def matmul_ada_mxf4_bf16(x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor, ws: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     return matmul_ada_mxf4_bf16_tn(x, w, xs.view(torch.float8_e8m0fnu), ws.view(torch.float8_e8m0fnu), alpha)
 
 
@@ -228,14 +245,51 @@ direct_register_custom_op(
 )
 
 
-def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor, forward_method: str) -> torch.Tensor:
-    x_flat = x.contiguous().flatten(end_dim=-2)
-    x_flat_q, x_flat_scales = torch.ops.vllm.fused_quantize_mx(x_flat, forward_hadamard_matrix, forward_method)
+def fused_quantize_nv(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return fusedQuantizeNv(x_flat, hadamard_matrix)
 
-    if x_flat.shape[-1] <= 64:
-        y = torch.ops.vllm.matmul_ada_mxf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, 1. / 9.)
+
+def fused_quantize_nv_fake(x_flat, hadamard_matrix):
+    rows, cols = x_flat.size(0), x_flat.size(1)//16
+    padded_rows = ((rows + 128 - 1) // 128) * 128
+    padded_cols = ((cols + 4 - 1) // 4) * 4
+    
+    xh_e2m1 = torch.empty(x_flat.size(0), x_flat.size(1) // 2, dtype=torch.uint8, device=x_flat.device)
+    xh_e8m0 = torch.empty(padded_rows, padded_cols, dtype=torch.float8_e4m3fn, device=x_flat.device)
+
+    return xh_e2m1, xh_e8m0
+
+
+direct_register_custom_op(
+    op_name="fused_quantize_nv",
+    op_func=fused_quantize_nv,
+    mutates_args=[],
+    fake_impl=fused_quantize_nv_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+
+def matmul_nvf4_bf16(x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor, ws: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    return matmul_nvf4_bf16_tn(x, w, to_blocked(xs).view(torch.float8_e4m3fn), to_blocked(ws).view(torch.float8_e4m3fn), alpha)
+
+
+def matmul_nvf4_bf16_fake(x, w, xs, ws, alpha):
+    return torch.empty(*x.shape[:-1], w.shape[0], dtype=torch.bfloat16, device=x.device)
+
+
+def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: torch.Tensor, weight_global_scale: torch.Tensor, act_global_scale: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor, forward_method: str, forward_dtype: str) -> torch.Tensor:
+    x_flat = x.contiguous().flatten(end_dim=-2)
+    if forward_dtype == "mxfp4":
+        x_flat_q, x_flat_scales = torch.ops.vllm.fused_quantize_mx(x_flat, forward_hadamard_matrix, forward_method)
+        if x_flat.shape[-1] <= 64:
+            y = torch.ops.vllm.matmul_ada_mxf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, weight_global_scale * act_global_scale)
+        else:
+            y = torch.ops.vllm.matmul_mxf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, weight_global_scale * act_global_scale)
+    elif forward_dtype == "nvfp4":
+        x_flat_q, x_flat_scales = torch.ops.vllm.fused_quantize_nv(x_flat, forward_hadamard_matrix)
+        y = torch.ops.vllm.matmul_nvf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, weight_global_scale * act_global_scale)
     else:
-        y = torch.ops.vllm.matmul_mxf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, 1. / 9.)
+        raise ValueError(f"Unsupported forward_dtype: {forward_dtype}")
     
     y = y.view(*x.shape[:-1], y.shape[-1])
     if bias is not None:
