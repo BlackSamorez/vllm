@@ -98,7 +98,7 @@ class FPQuantLinearMethod(LinearMethodBase):
                 "weight shape. This can be caused by too large "
                 "tensor parallel size. Or other skill issues.")
 
-        assert self.quant_config.forward_dtype == "mxfp4", "Only mxfp4 is supported for now"
+        assert self.quant_config.forward_dtype in ["mxfp4", "nvfp4"], "Only mxfp4 and nvfp4 are supported for now"
         qweight = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
@@ -139,17 +139,17 @@ class FPQuantLinearMethod(LinearMethodBase):
                 "input_dim": 1,
                 "output_dim": 0,
                 "packed_dim": 1,
-                "pack_factor": 32,
+                "pack_factor": group_size,
             },
         )
 
         weight_global_scale = Parameter(
-            torch.empty(1, dtype=params_dtype),
+            torch.empty(1, dtype=torch.float32),
             requires_grad=False,
         )
         set_weight_attrs(weight_global_scale, {"ignore_warning": True})
         act_global_scale = Parameter(
-            torch.empty(1, dtype=params_dtype),
+            torch.empty(1, dtype=torch.float32),
             requires_grad=False,
         )
         set_weight_attrs(act_global_scale, {"ignore_warning": True})
@@ -168,6 +168,10 @@ class FPQuantLinearMethod(LinearMethodBase):
         set_weight_attrs(qweight, extra_weight_attrs)
         layer.register_parameter("scales", scales)
         set_weight_attrs(scales, extra_weight_attrs)
+        layer.register_parameter("weight_global_scale", weight_global_scale)
+        set_weight_attrs(weight_global_scale, extra_weight_attrs)
+        layer.register_parameter("act_global_scale", act_global_scale)
+        set_weight_attrs(act_global_scale, extra_weight_attrs)
         layer.register_parameter("forward_hadamard_matrix", forward_hadamard_matrix)
         set_weight_attrs(forward_hadamard_matrix, extra_weight_attrs)
         layer.register_parameter("backward_hadamard_matrix", backward_hadamard_matrix)
@@ -180,7 +184,7 @@ class FPQuantLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return quantized_forward(x, layer.qweight, layer.scales, layer.weight_global_scale, layer.act_global_scale, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method)
+        return quantized_forward(x, layer.qweight, layer.scales, layer.weight_global_scale, layer.act_global_scale, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method, self.quant_config.forward_dtype)
 
 
 def fused_quantize_mx(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor, forward_method: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -229,7 +233,7 @@ direct_register_custom_op(
 
 
 def matmul_ada_mxf4_bf16(x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor, ws: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-    return matmul_ada_mxf4_bf16_tn(x, w, xs.view(torch.float8_e8m0fnu), ws.view(torch.float8_e8m0fnu), alpha)
+    return matmul_ada_mxf4_bf16_tn(x, w, xs.view(torch.float8_e8m0fnu), ws.view(torch.float8_e8m0fnu), alpha.cpu())
 
 
 def matmul_ada_mxf4_bf16_fake(x, w, xs, ws, alpha):
@@ -245,11 +249,11 @@ direct_register_custom_op(
 )
 
 
-def fused_quantize_nv(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    return fusedQuantizeNv(x_flat, hadamard_matrix)
+def fused_quantize_nv(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor, global_scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return fusedQuantizeNv(x_flat, hadamard_matrix, global_scale)
 
 
-def fused_quantize_nv_fake(x_flat, hadamard_matrix):
+def fused_quantize_nv_fake(x_flat, hadamard_matrix, global_scale):
     rows, cols = x_flat.size(0), x_flat.size(1)//16
     padded_rows = ((rows + 128 - 1) // 128) * 128
     padded_cols = ((cols + 4 - 1) // 4) * 4
@@ -277,6 +281,15 @@ def matmul_nvf4_bf16_fake(x, w, xs, ws, alpha):
     return torch.empty(*x.shape[:-1], w.shape[0], dtype=torch.bfloat16, device=x.device)
 
 
+direct_register_custom_op(
+    op_name="matmul_nvf4_bf16",
+    op_func=matmul_nvf4_bf16,
+    mutates_args=[],
+    fake_impl=matmul_nvf4_bf16_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+
 def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: torch.Tensor, weight_global_scale: torch.Tensor, act_global_scale: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor, forward_method: str, forward_dtype: str) -> torch.Tensor:
     x_flat = x.contiguous().flatten(end_dim=-2)
     if forward_dtype == "mxfp4":
@@ -286,7 +299,7 @@ def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: tor
         else:
             y = torch.ops.vllm.matmul_mxf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, weight_global_scale * act_global_scale)
     elif forward_dtype == "nvfp4":
-        x_flat_q, x_flat_scales = torch.ops.vllm.fused_quantize_nv(x_flat, forward_hadamard_matrix)
+        x_flat_q, x_flat_scales = torch.ops.vllm.fused_quantize_nv(x_flat, forward_hadamard_matrix, act_global_scale)
         y = torch.ops.vllm.matmul_nvf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, weight_global_scale * act_global_scale)
     else:
         raise ValueError(f"Unsupported forward_dtype: {forward_dtype}")
