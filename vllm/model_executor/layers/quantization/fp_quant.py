@@ -295,12 +295,12 @@ def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: tor
     if forward_dtype == "mxfp4":
         x_flat_q, x_flat_scales = torch.ops.vllm.fused_quantize_mx(x_flat, forward_hadamard_matrix, forward_method)
         if x_flat.shape[-1] <= 64:
-            y = torch.ops.vllm.matmul_ada_mxf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, weight_global_scale * act_global_scale)
+            y = torch.ops.vllm.matmul_ada_mxf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, 1 / (weight_global_scale * act_global_scale))
         else:
-            y = torch.ops.vllm.matmul_mxf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, weight_global_scale * act_global_scale)
+            y = torch.ops.vllm.matmul_mxf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, 1 / (weight_global_scale * act_global_scale))
     elif forward_dtype == "nvfp4":
         x_flat_q, x_flat_scales = torch.ops.vllm.fused_quantize_nv(x_flat, forward_hadamard_matrix, act_global_scale)
-        y = torch.ops.vllm.matmul_nvf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, weight_global_scale * act_global_scale)
+        y = torch.ops.vllm.matmul_nvf4_bf16(x_flat_q, qweight, x_flat_scales, weight_scales, 1 / (weight_global_scale * act_global_scale))
     else:
         raise ValueError(f"Unsupported forward_dtype: {forward_dtype}")
     
