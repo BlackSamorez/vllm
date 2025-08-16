@@ -123,8 +123,7 @@ class FPQuantLinearMethod(LinearMethodBase):
             group_size = 16
         else:
             raise ValueError(f"Unsupported forward_dtype: {self.quant_config.forward_dtype}")
-        
-        assert self.quant_config.hadamard_group_size == group_size, "Only hadamard_group_size of 32 is supported for now"
+
         scales = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
