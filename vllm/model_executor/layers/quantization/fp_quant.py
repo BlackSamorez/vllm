@@ -14,7 +14,7 @@ from qutlass import matmul_mxf4_bf16_tn, matmul_ada_mxf4_bf16_tn, fusedQuantizeM
 from qutlass.utils import to_blocked
 
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
+from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -31,16 +31,19 @@ class FPQuantConfig(QuantizationConfig):
         hadamard_group_size: int = 32,
         forward_dtype: str = "mxfp4",
         forward_method: str = "abs_max",
+        modules_to_not_convert: list[str] = None,
     ) -> None:
         super().__init__()
         self.hadamard_group_size = hadamard_group_size
         self.forward_dtype = forward_dtype
         self.forward_method = forward_method
+        self.modules_to_not_convert = modules_to_not_convert
 
     def __repr__(self) -> str:
         return (f"FPQuantConfig(hadamard_group_size={self.hadamard_group_size}, "
                 f"forward_dtype={self.forward_dtype}, "
-                f"forward_method={self.forward_method})")
+                f"forward_method={self.forward_method}, "
+                f"modules_to_not_convert={self.modules_to_not_convert})")
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -63,10 +66,15 @@ class FPQuantConfig(QuantizationConfig):
         hadamard_group_size = cls.get_from_keys(config, ["hadamard_group_size"])
         forward_dtype = cls.get_from_keys(config, ["forward_dtype"])
         forward_method = cls.get_from_keys(config, ["forward_method"])
-        return cls(hadamard_group_size, forward_dtype, forward_method)
+        modules_to_not_convert = cls.get_from_keys(config, ["modules_to_not_convert"])
+        return cls(hadamard_group_size, forward_dtype, forward_method, modules_to_not_convert)
 
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> Optional["FPQuantLinearMethod"]:
+        if self.modules_to_not_convert is not None:
+            if any(prefix.endswith(module) for module in self.modules_to_not_convert):
+                return UnquantizedLinearMethod()
+        
         if isinstance(layer, LinearBase):
             return FPQuantLinearMethod(self)
         return None
