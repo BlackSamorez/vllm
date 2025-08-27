@@ -18,6 +18,8 @@ from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase, Unqu
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
+from vllm.model_executor.layers.quantization.fp_quant_triton.mxfp4 import mxfp4_forward_kernel_wrapper
+from vllm.model_executor.layers.quantization.fp_quant_triton.nvfp4 import nvfp4_forward_kernel_wrapper
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
@@ -31,18 +33,21 @@ class FPQuantConfig(QuantizationConfig):
         hadamard_group_size: int = 32,
         forward_dtype: str = "mxfp4",
         forward_method: str = "abs_max",
+        pseudoquantization: bool = False,
         modules_to_not_convert: list[str] = None,
     ) -> None:
         super().__init__()
         self.hadamard_group_size = hadamard_group_size
         self.forward_dtype = forward_dtype
         self.forward_method = forward_method
+        self.pseudoquantization = pseudoquantization
         self.modules_to_not_convert = modules_to_not_convert
 
     def __repr__(self) -> str:
         return (f"FPQuantConfig(hadamard_group_size={self.hadamard_group_size}, "
                 f"forward_dtype={self.forward_dtype}, "
                 f"forward_method={self.forward_method}, "
+                f"pseudoquantization={self.pseudoquantization}, "
                 f"modules_to_not_convert={self.modules_to_not_convert})")
 
     @classmethod
@@ -66,8 +71,9 @@ class FPQuantConfig(QuantizationConfig):
         hadamard_group_size = cls.get_from_keys(config, ["hadamard_group_size"])
         forward_dtype = cls.get_from_keys(config, ["forward_dtype"])
         forward_method = cls.get_from_keys(config, ["forward_method"])
+        pseudoquantization = cls.get_from_keys(config, ["pseudoquantization"])
         modules_to_not_convert = cls.get_from_keys(config, ["modules_to_not_convert"])
-        return cls(hadamard_group_size, forward_dtype, forward_method, modules_to_not_convert)
+        return cls(hadamard_group_size, forward_dtype, forward_method, pseudoquantization, modules_to_not_convert)
 
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> Optional["FPQuantLinearMethod"]:
@@ -107,24 +113,6 @@ class FPQuantLinearMethod(LinearMethodBase):
                 "tensor parallel size. Or other skill issues.")
 
         assert self.quant_config.forward_dtype in ["mxfp4", "nvfp4"], "Only mxfp4 and nvfp4 are supported for now"
-        qweight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition // 2,
-                dtype=torch.uint8,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(
-            qweight,
-            {
-                "input_dim": 1,
-                "output_dim": 0,
-                "packed_dim": 1,
-                "pack_factor": 2,
-            },
-        )
-
         if self.quant_config.forward_dtype == "mxfp4":
             group_size = 32
         elif self.quant_config.forward_dtype == "nvfp4":
@@ -132,57 +120,93 @@ class FPQuantLinearMethod(LinearMethodBase):
         else:
             raise ValueError(f"Unsupported forward_dtype: {self.quant_config.forward_dtype}")
 
-        scales = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition // group_size,
-                dtype=torch.uint8,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(
-            scales,
-            {
-                "input_dim": 1,
-                "output_dim": 0,
-                "packed_dim": 1,
-                "pack_factor": group_size,
-            },
-        )
+        if self.quant_config.pseudoquantization:
+            dqweight = Parameter(
+                torch.empty(
+                    sum(output_partition_sizes),
+                    input_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(
+                dqweight,
+                {
+                    "input_dim": 1,
+                    "output_dim": 0,
+                    "packed_dim": 1,
+                    "pack_factor": 1,
+                } | extra_weight_attrs,
+            )
+            layer.register_parameter("dqweight", dqweight)
+        else:
+        
+            qweight = Parameter(
+                torch.empty(
+                    sum(output_partition_sizes),
+                    input_size_per_partition // 2,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(
+                qweight,
+                {
+                    "input_dim": 1,
+                    "output_dim": 0,
+                    "packed_dim": 1,
+                    "pack_factor": 2,
+                } | extra_weight_attrs,
+            )
+            layer.register_parameter("qweight", qweight)
+
+            scales = Parameter(
+                torch.empty(
+                    sum(output_partition_sizes),
+                    input_size_per_partition // group_size,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(
+                scales,
+                {
+                    "input_dim": 1,
+                    "output_dim": 0,
+                    "packed_dim": 1,
+                    "pack_factor": group_size,
+                } | extra_weight_attrs,
+            )
+            layer.register_parameter("scales", scales)
+
 
         weight_global_scale = Parameter(
             torch.empty(1, dtype=torch.float32),
             requires_grad=False,
         )
-        set_weight_attrs(weight_global_scale, {"ignore_warning": True})
+        set_weight_attrs(weight_global_scale, {"ignore_warning": True} | extra_weight_attrs)
+        layer.register_parameter("weight_global_scale", weight_global_scale)
+        
         act_global_scale = Parameter(
             torch.empty(1, dtype=torch.float32),
             requires_grad=False,
         )
-        set_weight_attrs(act_global_scale, {"ignore_warning": True})
+        set_weight_attrs(act_global_scale, {"ignore_warning": True} | extra_weight_attrs)
+        layer.register_parameter("act_global_scale", act_global_scale)   
+            
         forward_hadamard_matrix = Parameter(
             torch.empty(self.quant_config.hadamard_group_size, self.quant_config.hadamard_group_size, dtype=params_dtype),
             requires_grad=False,
         )
-        set_weight_attrs(forward_hadamard_matrix, {"ignore_warning": True})
+        set_weight_attrs(forward_hadamard_matrix, {"ignore_warning": True} | extra_weight_attrs)
+        layer.register_parameter("forward_hadamard_matrix", forward_hadamard_matrix)
+        
         backward_hadamard_matrix = Parameter(
             torch.empty(self.quant_config.hadamard_group_size, self.quant_config.hadamard_group_size, dtype=params_dtype),
             requires_grad=False,
         )
-        set_weight_attrs(backward_hadamard_matrix, {"ignore_warning": True})
-
-        layer.register_parameter("qweight", qweight)
-        set_weight_attrs(qweight, extra_weight_attrs)
-        layer.register_parameter("scales", scales)
-        set_weight_attrs(scales, extra_weight_attrs)
-        layer.register_parameter("weight_global_scale", weight_global_scale)
-        set_weight_attrs(weight_global_scale, extra_weight_attrs)
-        layer.register_parameter("act_global_scale", act_global_scale)
-        set_weight_attrs(act_global_scale, extra_weight_attrs)
-        layer.register_parameter("forward_hadamard_matrix", forward_hadamard_matrix)
-        set_weight_attrs(forward_hadamard_matrix, extra_weight_attrs)
+        set_weight_attrs(backward_hadamard_matrix, {"ignore_warning": True} | extra_weight_attrs)
         layer.register_parameter("backward_hadamard_matrix", backward_hadamard_matrix)
-        set_weight_attrs(backward_hadamard_matrix, extra_weight_attrs)
 
 
     def apply(
@@ -191,7 +215,10 @@ class FPQuantLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return quantized_forward(x, layer.qweight, layer.scales, layer.weight_global_scale, layer.act_global_scale, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method, self.quant_config.forward_dtype)
+        if self.quant_config.pseudoquantization:
+            return pseudoquantized_forward(x, layer.dqweight, layer.act_global_scale, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method, self.quant_config.forward_dtype)
+        else:
+            return quantized_forward(x, layer.qweight, layer.scales, layer.weight_global_scale, layer.act_global_scale, bias, layer.forward_hadamard_matrix, self.quant_config.forward_method, self.quant_config.forward_dtype)
 
 
 def fused_quantize_mx(x_flat: torch.Tensor, hadamard_matrix: torch.Tensor, forward_method: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -316,3 +343,29 @@ def quantized_forward(x: torch.Tensor, qweight: torch.Tensor, weight_scales: tor
         y += bias
     
     return y
+
+
+def pseudoquantized_forward(x: torch.Tensor, dqweight: torch.Tensor, act_global_scale: torch.Tensor, bias: Optional[torch.Tensor], forward_hadamard_matrix: torch.Tensor, forward_method: str, forward_dtype: str) -> torch.Tensor:    
+    x_flat = x.contiguous().flatten(end_dim=-2)
+
+    # Pseudoquantize input
+    if forward_dtype == "mxfp4":
+        x_flat_dq, _ = mxfp4_forward_kernel_wrapper(
+            x_flat,
+            forward_hadamard_matrix,
+            gaussian_scale=2.92247856 / 6.0 if forward_method == "quest" else 3.0 / 4.0,
+            quest=forward_method == "quest",
+        )
+    elif forward_dtype == "nvfp4":
+        x_flat_dq = nvfp4_forward_kernel_wrapper(
+            x_flat,
+            forward_hadamard_matrix,
+            act_global_scale,
+        )
+    else:
+        raise ValueError(f"Unsupported forward_dtype: {forward_dtype}")
+
+    y = torch.nn.functional.linear(x_flat_dq, dqweight, bias)
+
+    return y.unflatten(dim=0, sizes=x.shape[:-1])
+    
