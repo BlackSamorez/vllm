@@ -10,8 +10,20 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from qutlass import matmul_mxf4_bf16_tn, matmul_ada_mxf4_bf16_tn, fusedQuantizeMx, matmul_nvf4_bf16_tn, fusedQuantizeNv
-from qutlass.utils import to_blocked
+try:
+    from qutlass import matmul_mxf4_bf16_tn, matmul_ada_mxf4_bf16_tn, fusedQuantizeMx, matmul_nvf4_bf16_tn, fusedQuantizeNv
+    from qutlass.utils import to_blocked
+    CUTLASS_FOUND = True
+except ImportError:
+    CUTLASS_FOUND = False
+    print("qutlass not found, using fake implementations")
+    matmul_mxf4_bf16_tn = None
+    matmul_ada_mxf4_bf16_tn = None
+    fusedQuantizeMx = None
+    matmul_nvf4_bf16_tn = None
+    fusedQuantizeNv = None
+    to_blocked = None
+
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
@@ -42,6 +54,8 @@ class FPQuantConfig(QuantizationConfig):
         self.forward_method = forward_method
         self.pseudoquantization = pseudoquantization
         self.modules_to_not_convert = modules_to_not_convert
+        if not self.pseudoquantization and not CUTLASS_FOUND:
+            raise ValueError("qutlass not found, using fake implementations")
 
     def __repr__(self) -> str:
         return (f"FPQuantConfig(hadamard_group_size={self.hadamard_group_size}, "
@@ -60,7 +74,7 @@ class FPQuantConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 100
+        return 100 if CUTLASS_FOUND else 70
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
