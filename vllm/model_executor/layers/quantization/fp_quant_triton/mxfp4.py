@@ -1,19 +1,32 @@
-from random import randint
+from itertools import product
 
 import torch
 import triton
 import triton.language as tl
 
 
+def get_autotuning_config(configs, named_args, **kwargs):
+    hadamard_dim = kwargs["hadamard_dim"]
+    # Block size has to be chosen such, that BLOCK_SIZE // hadamard_dim is multiple of 16
+    BLOCK_SIZES = [32 * 32, 64 * 32, 128 * 32, 256 * 32, 512 * 32]
+
+    block_size_step = 16 * hadamard_dim
+
+    for config in configs:
+        num_warps = config.num_warps
+        num_stages = config.num_stages
+        for block_size in BLOCK_SIZES:
+            if block_size // block_size_step > 0 and block_size % block_size_step == 0:
+                yield triton.Config({"BLOCK_SIZE": block_size}, num_warps=num_warps, num_stages=num_stages) 
+
+
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_SIZE": 32 * 32}),
-        triton.Config({"BLOCK_SIZE": 64 * 32}),
-        triton.Config({"BLOCK_SIZE": 128 * 32}),
-        triton.Config({"BLOCK_SIZE": 256 * 32}),
-        triton.Config({"BLOCK_SIZE": 512 * 32}),
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages) 
+        for num_stages, num_warps in product([1, 2], [1, 2, 4, 8])
     ],
-    key=[],
+    prune_configs_by={"early_config_prune": get_autotuning_config},
+    key=[]
 )
 @triton.jit
 def mxfp4_forward_kernel(
